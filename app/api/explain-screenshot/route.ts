@@ -1,17 +1,24 @@
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+export const runtime = "nodejs";
 
 type AnalysisMode = "kitchen" | "warehouse" | "office";
 
 export async function POST(request: NextRequest) {
   try {
+    // ✅ Vercel build sırasında patlamasın: key yoksa düzgün cevap dön
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      return NextResponse.json(
+        { error: "OPENAI_API_KEY is not set on the server" },
+        { status: 500 }
+      );
+    }
+
     const formData = await request.formData();
     const image = formData.get("image") as File | null;
-    const mode = ((formData.get("mode") as string) || "kitchen") as AnalysisMode;
+    const mode = (formData.get("mode") as AnalysisMode) || "kitchen";
 
     if (!image) {
       return NextResponse.json({ error: "No image provided" }, { status: 400 });
@@ -33,105 +40,52 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Convert image to data URL
+    const prompt = getPromptForMode(mode);
+
+    // Convert image to base64 data URL
     const bytes = await image.arrayBuffer();
     const base64 = Buffer.from(bytes).toString("base64");
     const dataUrl = `data:${image.type};base64,${base64}`;
 
-    const prompt = getPromptForMode(mode);
+    // ✅ OpenAI client sadece request sırasında oluşturulsun
+    const openai = new OpenAI({ apiKey });
 
-    // ✅ Use Responses API (current)
-    const resp = await openai.responses.create({
+    const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
-      input: [
+      messages: [
         {
           role: "user",
           content: [
-            { type: "input_text", text: prompt },
-            { type: "input_image", image_url: dataUrl },
+            { type: "text", text: prompt },
+            { type: "image_url", image_url: { url: dataUrl } },
           ],
         },
       ],
-      max_output_tokens: 900,
-    } as any);
+      max_tokens: 900,
+    });
 
-    const content = (resp as any)?.output_text?.trim?.() ? (resp as any).output_text : "";
-
-    // If model returns empty output, respond gracefully
-    if (!content.trim()) {
-      return NextResponse.json(
-        {
-          whatISee: "",
-          whatThisMeans: "",
-          possibleIssues: "",
-          whatYouCanDoNext: "",
-          riskLevel: "LOW",
-          raw: "",
-          error: "Empty model output. Check billing/credits or try another image.",
-        },
-        { status: 200 }
-      );
-    }
+    const content = completion.choices[0]?.message?.content || "";
 
     const sections = {
       whatISee: extract("WHAT_I_SEE", content),
       whatThisMeans: extract("WHAT_THIS_MEANS", content),
       possibleIssues: extract("POSSIBLE_ISSUES", content),
       whatYouCanDoNext: extract("WHAT_YOU_CAN_DO_NEXT", content),
-      riskLevel: normalizeRisk(extract("RISK_LEVEL", content)),
+      riskLevel: extractRiskLevel(content),
       raw: content,
-      result: content, // (optional) UI fallback
     };
 
     return NextResponse.json(sections);
-  } catch (error: any) {
-    // Better error messages
-    const status = error?.status || 500;
-    const msg =
-      error?.message ||
-      (status === 429
-        ? "API quota exceeded. Check OpenAI billing/credits."
-        : "Failed to analyze screenshot");
-
-    console.error("VISION ERROR:", error);
-    return NextResponse.json({ error: msg }, { status });
+  } catch (err: any) {
+    console.error("VISION ERROR:", err?.message || err);
+    return NextResponse.json(
+      { error: "Failed to analyze screenshot" },
+      { status: 500 }
+    );
   }
 }
 
-/**
- * ✅ Strong marker-based extraction:
- * Looks for:
- * [TAG]
- * ...content...
- * until next [OTHER_TAG] or end.
- */
-function extract(tag: string, text: string): string {
-  const r = new RegExp(
-    `\\[${escapeRegex(tag)}\\]\\s*([\\s\\S]*?)(?=\\n\\s*\\[[A-Z0-9_]+\\]|$)`,
-    "i"
-  );
-  const m = text.match(r);
-  return m ? m[1].trim() : "";
-}
-
-function normalizeRisk(raw: string): "LOW" | "MEDIUM" | "HIGH" {
-  const s = (raw || "").toUpperCase();
-  if (s.includes("HIGH")) return "HIGH";
-  if (s.includes("MEDIUM")) return "MEDIUM";
-  return "LOW";
-}
-
-function escapeRegex(s: string) {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-/**
- * ✅ Prompt includes a "workplace gate" so t-shirt/ads don't get kitchen analysis.
- * Also enforces:
- * - No markdown
- * - Strict markers
- * - No placeholders/instructions in output
- */
+// ---------- Prompt (your exact logic) ----------
 function getPromptForMode(mode: AnalysisMode) {
   if (mode === "warehouse") {
     return `
@@ -288,4 +242,18 @@ LOW / MEDIUM / HIGH - short reason.
 
 Be conservative. If unsure, say so.
 `.trim();
+}
+
+// ---------- Parsing ----------
+function extract(tag: string, text: string): string {
+  // [TAG] ... until next [OTHER_TAG] or end
+  const r = new RegExp(`\\[${tag}\\]\\s*([\\s\\S]*?)(?=\\n\\[|$)`, "i");
+  const m = text.match(r);
+  return m ? m[1].trim() : "";
+}
+
+function extractRiskLevel(text: string): "LOW" | "MEDIUM" | "HIGH" {
+  const m = text.match(/\[RISK_LEVEL\]\s*(LOW|MEDIUM|HIGH)/i);
+  if (!m) return "LOW";
+  return m[1].toUpperCase() as "LOW" | "MEDIUM" | "HIGH";
 }
